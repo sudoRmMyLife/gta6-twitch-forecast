@@ -144,3 +144,39 @@ for (const { params: w } of stage1.slice(0, 6)) {
 stage2.sort((a, b) => a.loss - b.loss);
 console.log('\nstage 2 top 10 (weights + calibration):');
 for (const r of stage2.slice(0, 10)) console.log(`  ${r.loss.toFixed(4)}  ${JSON.stringify(r.params)}`);
+
+// Stage 3: refine around the stage-2 winner, including the median smoothing
+// and the late-day spread drift.
+const w2 = stage2[0].params;
+const stage3 = [];
+for (const bwScale of [1.1, 1.4, 1.8]) {
+  for (const bwChan of [2.4, 3.2, 4.5]) {
+    for (const unlockPen of [1.4, 1.8, 2.3]) {
+      for (const smoothMed of [0, 0.2, 0.35]) {
+        for (const spreadLate of [0.9, 1.0, 1.1]) {
+          const p = { ...w2, bwScale, bwChan, unlockPen, smoothMed, spreadLate };
+          stage3.push({ loss: looLoss(p), params: p });
+        }
+      }
+    }
+  }
+}
+stage3.sort((a, b) => a.loss - b.loss);
+console.log('\nstage 3 top 5 (refined weights, smoothing, late spread):');
+for (const r of stage3.slice(0, 5)) console.log(`  ${r.loss.toFixed(4)}  ${JSON.stringify(r.params)}`);
+
+// Stage 4: calibration once more, finely, around the stage-3 winner.
+const w3 = stage3[0].params;
+const stage4 = [];
+for (const medShrink of [1.2, 1.32, 1.45, 1.6]) {
+  for (const spreadScale of [0.85]) {
+    for (const baseBlend of [0.07]) {
+      const p = { ...w3, medShrink, spreadScale, baseBlend };
+      stage4.push({ loss: looLoss(p), params: p });
+    }
+  }
+}
+stage4.sort((a, b) => a.loss - b.loss);
+console.log('\nstage 4 top 5 (final calibration):');
+for (const r of stage4.slice(0, 5)) console.log(`  ${r.loss.toFixed(4)}  ${JSON.stringify(r.params)}`);
+console.log(`\nBEST: ${stage4[0].loss.toFixed(4)}  ${JSON.stringify(stage4[0].params)}`);

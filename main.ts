@@ -8,12 +8,13 @@
 // quantile over the comparables and the weights reward similarity to the
 // target: closeness in first-hour viewers, first-hour live channels, release
 // era, and unlock pattern (a rolling midnight-local unlock ramps through the
-// UTC day very differently from one simultaneous global unlock). The weighted
-// median is shrunk a little toward persistence (ratio 1) and the weighted
-// spread is rescaled; both calibrations, and the similarity bandwidths, were
-// fitted by leave-one-out cross-validation over the comparables themselves
-// (tools/tune.mjs), never on a graded game. Where an hour has no comparable
-// data the forecast falls back to the persistence spread.
+// UTC day very differently from one simultaneous global unlock). The median
+// curve is lightly smoothed across neighbouring hours and rescaled, and the
+// spread around it is rescaled and blended a little toward the persistence
+// fallback; every constant, bandwidths included, was fitted by leave-one-out
+// cross-validation over the comparables themselves (tools/tune.mjs), never
+// on a graded game. Where an hour has no comparable data the forecast falls
+// back to the persistence spread.
 //
 // Node 22, standard library only, no network, deterministic: the same case
 // file always produces the same bytes.
@@ -37,22 +38,33 @@ export interface ForecastParams {
   bwEra: number;
   /** Extra standardised distance when the unlock pattern differs. */
   unlockPen: number;
-  /** Shrinkage of the weighted median log-ratio toward 0 (persistence). */
+  /** Scale applied to the weighted median log-ratio (1 = as pooled). The
+   *  leave-one-out fit puts it above 1: the pooled median curve is biased
+   *  toward the flatter shapes of smaller launches, so it is expanded away
+   *  from persistence to correct that. */
   medShrink: number;
   /** Rescaling of the weighted spread around the median, in log space. */
   spreadScale: number;
   /** Blend of the whole quantile curve toward the persistence fallback. */
   baseBlend: number;
+  /** Smoothing of the median log-ratio across neighbouring hours (0 = off):
+   *  launch-day curves are smooth, per-hour quantile noise is not. */
+  smoothMed: number;
+  /** Extra spread multiplier reached by hour 24 (1 = flat): uncertainty about
+   *  the curve's shape need not grow at the fallback's rate. */
+  spreadLate: number;
 }
 
 export const DEFAULT_PARAMS: ForecastParams = {
-  bwScale: 1.6,
-  bwChan: 1.4,
+  bwScale: 1.4,
+  bwChan: 4.5,
   bwEra: 5,
-  unlockPen: 0.9,
-  medShrink: 0.95,
-  spreadScale: 1.1,
-  baseBlend: 0.15,
+  unlockPen: 2.3,
+  medShrink: 1.2,
+  spreadScale: 0.85,
+  baseBlend: 0.07,
+  smoothMed: 0.2,
+  spreadLate: 1,
 };
 
 interface HourPoint {
@@ -181,7 +193,9 @@ export function forecastCase(c: CaseFile, params: ForecastParams): { hours: Arra
     pool.push({ feats, weight: Math.exp(-d2), logV1 });
   }
 
-  const hours = (c.forecast ?? []).map(({ hour }) => {
+  // First pass: the raw weighted quantile curve of each hour, ascending.
+  const ordered = [...(c.forecast ?? [])].sort((a, b) => a.hour - b.hour);
+  const rawCurves = ordered.map(({ hour }) => {
     const ratios: number[] = [];
     const weights: number[] = [];
     for (const entry of pool) {
@@ -190,15 +204,33 @@ export function forecastCase(c: CaseFile, params: ForecastParams): { hours: Arra
       ratios.push(Math.log(vh) - entry.logV1);
       weights.push(entry.weight);
     }
+    if (ratios.length === 0) return null;
+    return LEVELS.map((tau) => weightedQuantile(ratios, weights, tau));
+  });
+  // Smooth the median across neighbouring hours before calibrating.
+  const medians = rawCurves.map((curve) => (curve === null ? null : curve[2]));
+  const smoothCentre = medians.map((med, i) => {
+    if (med === null || params.smoothMed === 0) return med;
+    const neighbours = [medians[i - 1], medians[i + 1]].filter((x): x is number => x !== null && x !== undefined);
+    if (neighbours.length === 0) return med;
+    const avg = neighbours.reduce((s, x) => s + x, 0) / neighbours.length;
+    return (1 - params.smoothMed) * med + params.smoothMed * avg;
+  });
+
+  const byHour = new Map<number, number[]>();
+  ordered.forEach(({ hour }, i) => {
     const base = Z.map((z) => z * BASE_SIGMA * Math.sqrt(hour - 1));
+    const curve = rawCurves[i];
     let logs: number[];
-    if (ratios.length === 0) {
+    if (curve === null) {
       logs = base;
     } else {
-      const med = weightedQuantile(ratios, weights, 0.5);
+      const med = curve[2];
+      const centre = smoothCentre[i] ?? med;
+      const spread = params.spreadScale * (1 + (params.spreadLate - 1) * ((hour - 2) / 22));
       logs = LEVELS.map((tau, j) => {
-        const raw = weightedQuantile(ratios, weights, tau);
-        const calibrated = params.medShrink * med + params.spreadScale * (raw - med);
+        const shifted = curve[j] - med + centre;
+        const calibrated = params.medShrink * centre + spread * (shifted - centre);
         return (1 - params.baseBlend) * calibrated + params.baseBlend * base[j];
       });
     }
@@ -212,9 +244,9 @@ export function forecastCase(c: CaseFile, params: ForecastParams): { hours: Arra
       q.push(v);
       prev = v;
     }
-    return { hour, q };
+    byHour.set(hour, q);
   });
-  return { hours };
+  return { hours: (c.forecast ?? []).map(({ hour }) => ({ hour, q: byHour.get(hour) as number[] })) };
 }
 
 function main(): void {
